@@ -249,6 +249,7 @@ fn fetch_all_players(url: &str, standings_teams: &[String]) -> Result<Vec<Record
                 row[6].clone(),
                 row[7].clone(),
                 row.get(11).cloned().unwrap_or_default(),
+                row.get(8).cloned().unwrap_or_default(),
                 goals_per_game,
                 assists_per_game,
                 points_per_game,
@@ -606,7 +607,7 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                 ),
                 1 => (
                     vec![
-                        "#", "Spelare", "Lag", "GP", "G", "A", "P", "+/-", "G/MP", "A/MP", "P/MP",
+                        "#", "Spelare", "Lag", "GP", "G", "A", "P", "+/-", "PIM", "G/MP", "A/MP", "P/MP",
                     ],
                     &filtered_players,
                 ),
@@ -656,6 +657,7 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                     Constraint::Length(5),
                     Constraint::Length(5),
                     Constraint::Length(5),
+                    Constraint::Length(5),
                     Constraint::Length(6),
                     Constraint::Length(6),
                     Constraint::Length(6),
@@ -684,7 +686,14 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                     Constraint::Length(13),
                 ],
             };
-            let rows = records.iter().map(|r| {
+            let mut rows = Vec::with_capacity(records.len() + 3);
+            for (record_index, r) in records.iter().enumerate() {
+                if app.tab == 2 && [6, 10, 12].contains(&record_index) {
+                    let separator = widths.iter().map(|_| {
+                        Cell::from("─".repeat(32)).style(Style::default().fg(Color::DarkGray))
+                    }).collect::<Vec<_>>();
+                    rows.push(Row::new(separator));
+                }
                 let cells =
                     r.0.iter()
                         .enumerate()
@@ -699,10 +708,10 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                             }
                         })
                         .collect::<Vec<_>>();
-                Row::new(cells)
-            });
+                rows.push(Row::new(cells));
+            }
             let player_title = format!(
-                " SPELARE ({}) {} · g/a/p/x stats · m/b/e snitt ",
+                " SPELARE ({}) {} · g/a/p/x stats · i PIM · m/b/e snitt ",
                 filtered_players.len(),
                 if app.team_filter.is_empty() {
                     "alla lag".to_owned()
@@ -750,7 +759,11 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                 );
             let mut state = TableState::default();
             if !records.is_empty() {
-                state.select(Some(app.selected.min(records.len() - 1)));
+                let selected = app.selected.min(records.len() - 1);
+                let separators_before = if app.tab == 2 {
+                    [6, 10, 12].iter().filter(|boundary| selected >= **boundary).count()
+                } else { 0 };
+                state.select(Some(selected + separators_before));
             }
             frame.render_stateful_widget(table, chunks[1], &mut state);
             let footer = if app.searching_team {
@@ -767,7 +780,7 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                 app.status.clone()
             };
             let help = format!(
-                "{footer}\nTab flikar | ↑↓ navigera | / namn | l lag | r uppdatera | q avsluta\nSpelare: g/a/p/x stats, m/b/e snitt; versaler = lagvis | SHL: p poäng, s snitt\nMålvakt: g GP, s skott emot, v räddnings%, w vinster, c räddade; versaler = lagvis"
+                "{footer}\nTab flikar | ↑↓ navigera | / namn | l lag | r uppdatera | q avsluta\nSpelare: g/a/p/x stats, i PIM, m/b/e snitt; versaler = lagvis | SHL: p poäng, s snitt\nMålvakt: g GP, s skott emot, v räddnings%, w vinster, c räddade; versaler = lagvis"
             );
             frame.render_widget(
                 Paragraph::new(help).style(Style::default().fg(Color::Gray)),
@@ -993,6 +1006,7 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                     | KeyCode::Char('m')
                     | KeyCode::Char('b')
                     | KeyCode::Char('e')
+                    | KeyCode::Char('i')
                     | KeyCode::Char('G')
                     | KeyCode::Char('A')
                     | KeyCode::Char('P')
@@ -1000,6 +1014,7 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                     | KeyCode::Char('M')
                     | KeyCode::Char('B')
                     | KeyCode::Char('E')
+                    | KeyCode::Char('I')
                         if app.tab == 1 =>
                     {
                         let (col, by_team) = match key.code {
@@ -1007,16 +1022,18 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                             KeyCode::Char('a') => (5, false),
                             KeyCode::Char('p') => (6, false),
                             KeyCode::Char('x') => (7, false),
-                            KeyCode::Char('m') => (8, false),
-                            KeyCode::Char('b') => (9, false),
-                            KeyCode::Char('e') => (10, false),
+                            KeyCode::Char('i') => (8, false),
+                            KeyCode::Char('m') => (9, false),
+                            KeyCode::Char('b') => (10, false),
+                            KeyCode::Char('e') => (11, false),
                             KeyCode::Char('G') => (4, true),
                             KeyCode::Char('A') => (5, true),
                             KeyCode::Char('P') => (6, true),
                             KeyCode::Char('X') => (7, true),
-                            KeyCode::Char('M') => (8, true),
-                            KeyCode::Char('B') => (9, true),
-                            _ => (10, true),
+                            KeyCode::Char('I') => (8, true),
+                            KeyCode::Char('M') => (9, true),
+                            KeyCode::Char('B') => (10, true),
+                            _ => (11, true),
                         };
                         let descending = match app.sort {
                             Some((old_col, desc, old_team))
@@ -1058,8 +1075,9 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                             5 => "assist",
                             6 => "poäng",
                             7 => "+/-",
-                            8 => "mål per match",
-                            9 => "assist per match",
+                            8 => "utvisningsminuter",
+                            9 => "mål per match",
+                            10 => "assist per match",
                             _ => "poäng per match",
                         };
                         app.status = format!(

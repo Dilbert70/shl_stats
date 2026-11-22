@@ -52,15 +52,16 @@ Visar matcherna från de två senaste spelomgångarna och de två kommande omgå
 
 ## Spelare
 
-Visar spelare från alla SHL-lag med GP, mål, assist, poäng, +/-, samt mål-, assist- och poängsnitt per match.
+Visar spelare från alla SHL-lag med GP, mål, assist, poäng, +/-, utvisningsminuter (PIM), samt mål-, assist- och poängsnitt per match.
 
 | Tangent | Funktion |
 | --- | --- |
 | `/` | Sök efter spelarnamn. Skriv söktext och tryck `Enter`. `Esc` rensar sökningen. |
 | `l` | Filtrera på lag. Skriv hela eller en del av lagnamnet och tryck `Enter`. `Esc` rensar lagfiltret. |
 | `g`, `a`, `p`, `x` | Sortera globalt på mål, assist, poäng eller +/-. |
+| `i` | Sortera globalt på utvisningsminuter (PIM). |
 | `m`, `b`, `e` | Sortera globalt på mål-, assist- eller poängsnitt per match. |
-| Versalerna `G`, `A`, `P`, `X`, `M`, `B`, `E` | Sortera först alfabetiskt per lag och sedan på motsvarande statistik. |
+| Versalerna `G`, `A`, `P`, `X`, `I`, `M`, `B`, `E` | Sortera först alfabetiskt per lag och sedan på motsvarande statistik, inklusive PIM med `I`. |
 
 Tryck samma sorteringstangent igen för att vända sorteringsordningen. Den aktiva sorteringskolumnen markeras i fetstil. Sökning och lagfilter kan användas tillsammans.
 
