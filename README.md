@@ -44,7 +44,7 @@ Du kan också starta direkt från projektmappen med `cargo run`. Då bygger Carg
 
 Tryck `Tab` eller `→` för nästa flik och `←` för föregående. Flikarna är Matcher, Spelare, SHL-tabell och Målvakter. Använd `↑`/`↓` eller `k`/`j` för att flytta markeringen i listan.
 
-Tryck `r` för att hämta om statistiken. Tryck `q` eller `Esc` för att avsluta när du inte skriver i ett sökfält.
+Tryck `PageUp` för en äldre säsong och `PageDown` för en nyare. `[` och `]` fungerar också som alternativ. Tryck `r` för att hämta om statistiken för vald säsong. Tryck `q` eller `Esc` för att avsluta när du inte skriver i ett sökfält.
 
 ## Matcher
 

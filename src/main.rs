@@ -30,6 +30,12 @@ struct Data {
     season: String,
 }
 
+#[derive(Clone)]
+struct Season {
+    id: String,
+    label: String,
+}
+
 fn fetch_table(url: &str, preferred: &[&str]) -> Result<(String, Vec<Record>)> {
     let client = http_client()?;
     let body = client.get(url).send()?.error_for_status()?.text()?;
@@ -120,8 +126,70 @@ fn current_shl_id() -> Result<String> {
         .context("Kunde inte hitta aktuell SHL-säsong på stats.swehockey.se")
 }
 
-fn fetch_data() -> Result<Data> {
-    let season_id = current_shl_id()?;
+fn available_shl_seasons(current_id: &str) -> Result<Vec<Season>> {
+    let url = format!("{BASE_URL}/ScheduleAndResults/Overview/{current_id}");
+    let body = http_client()?.get(url).send()?.error_for_status()?.text()?;
+    let document = Html::parse_document(&body);
+    let options = Selector::parse("select option").unwrap();
+    let mut seasons = Vec::new();
+    for option in document.select(&options) {
+        let label = option
+            .text()
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !label.contains("SHL") || !label.chars().take(4).all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let Some(value) = option.value().attr("value") else {
+            continue;
+        };
+        let id = value
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(value);
+        if !id.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        if !seasons.iter().any(|season: &Season| season.id == id) {
+            seasons.push(Season {
+                id: id.to_owned(),
+                label,
+            });
+        }
+    }
+    // Swehockey's season selector is sometimes rendered without its options in the
+    // returned HTML. Keep the known SHL overview IDs available in that case.
+    for (id, label) in [
+        ("20961", "2026-27 - SHL"),
+        ("18263", "2025-26 - SHL"),
+        ("15977", "2024-25 - SHL"),
+        ("14677", "2023-24 - SHL"),
+        ("13469", "2022-23 - SHL"),
+        ("12318", "2021-22 - SHL"),
+        ("11450", "2020-21 - SHL"),
+    ] {
+        if !seasons.iter().any(|season| season.id == id) {
+            seasons.push(Season {
+                id: id.into(),
+                label: label.into(),
+            });
+        }
+    }
+    if !seasons.iter().any(|season| season.id == current_id) {
+        seasons.push(Season {
+            id: current_id.to_owned(),
+            label: format!("Aktuell SHL ({current_id})"),
+        });
+    }
+    seasons.sort_by(|a, b| b.label.cmp(&a.label));
+    Ok(seasons)
+}
+
+fn fetch_data(season: &Season) -> Result<Data> {
+    let season_id = &season.id;
     let games_url = format!("{BASE_URL}/ScheduleAndResults/Overview/{season_id}");
     let players_url = format!("{BASE_URL}/Teams/Info/PlayersByTeam/{season_id}");
     let standings_url = format!("{BASE_URL}/ScheduleAndResults/Standings/{season_id}");
@@ -146,7 +214,7 @@ fn fetch_data() -> Result<Data> {
         players,
         goalies,
         standings,
-        season: "SHL • aktuell säsong".into(),
+        season: season.label.clone(),
     })
 }
 
@@ -517,6 +585,8 @@ fn latest_and_upcoming_rounds(rows: Vec<Record>) -> Vec<Record> {
 
 struct App {
     data: Data,
+    seasons: Vec<Season>,
+    season_index: usize,
     tab: usize,
     selected: usize,
     sort: Option<(usize, bool, bool)>,
@@ -528,9 +598,16 @@ struct App {
     status: String,
 }
 
-fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> Result<()> {
+fn run_ui(
+    mut terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    data: Data,
+    seasons: Vec<Season>,
+    season_index: usize,
+) -> Result<()> {
     let mut app = App {
         data,
+        seasons,
+        season_index,
         tab: 0,
         selected: 0,
         sort: None,
@@ -780,7 +857,7 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                 app.status.clone()
             };
             let help = format!(
-                "{footer}\nTab flikar | ↑↓ navigera | / namn | l lag | r uppdatera | q avsluta\nSpelare: g/a/p/x stats, i PIM, m/b/e snitt; versaler = lagvis | SHL: p poäng, s snitt\nMålvakt: g GP, s skott emot, v räddnings%, w vinster, c räddade; versaler = lagvis"
+                "{footer}\nTab flikar | ↑↓ navigera | PgUp äldre / PgDn nyare säsong | / namn | l lag | r uppdatera | q avsluta\nSpelare: g/a/p/x stats, i PIM, m/b/e snitt; versaler = lagvis | SHL: p poäng, s snitt\nMålvakt: g GP, s skott emot, v räddnings%, w vinster, c räddade; versaler = lagvis"
             );
             frame.render_widget(
                 Paragraph::new(help).style(Style::default().fg(Color::Gray)),
@@ -876,7 +953,38 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.selected = app.selected.saturating_sub(1)
                     }
-                    KeyCode::Char('r') => match fetch_data() {
+                    KeyCode::PageUp
+                    | KeyCode::Char('[')
+                    | KeyCode::PageDown
+                    | KeyCode::Char(']') => {
+                        let next = if matches!(key.code, KeyCode::PageUp | KeyCode::Char('[')) {
+                            (app.season_index + 1).min(app.seasons.len().saturating_sub(1))
+                        } else {
+                            app.season_index.saturating_sub(1)
+                        };
+                        if next != app.season_index {
+                            match fetch_data(&app.seasons[next]) {
+                                Ok(data) => {
+                                    app.data = data;
+                                    app.season_index = next;
+                                    app.selected = 0;
+                                    app.sort = None;
+                                    app.status = format!("Visar {}.", app.data.season);
+                                }
+                                Err(error) => {
+                                    app.status = format!("Kunde inte byta säsong: {error:#}")
+                                }
+                            }
+                        } else {
+                            app.status = if matches!(key.code, KeyCode::PageUp | KeyCode::Char('['))
+                            {
+                                "Redan på den äldsta säsongen.".into()
+                            } else {
+                                "Redan på den nyaste säsongen.".into()
+                            };
+                        }
+                    }
+                    KeyCode::Char('r') => match fetch_data(&app.seasons[app.season_index]) {
                         Ok(data) => {
                             app.data = data;
                             app.selected = 0;
@@ -1095,12 +1203,18 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
 }
 
 fn main() -> Result<()> {
-    let data = fetch_data()?;
+    let current_id = current_shl_id()?;
+    let seasons = available_shl_seasons(&current_id)?;
+    let season_index = seasons
+        .iter()
+        .position(|season| season.id == current_id)
+        .unwrap_or(0);
+    let data = fetch_data(&seasons[season_index])?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let result = run_ui(terminal, data);
+    let result = run_ui(terminal, data, seasons, season_index);
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     result
