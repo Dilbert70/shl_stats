@@ -131,11 +131,7 @@ fn fetch_data() -> Result<Data> {
         .context("Kunde inte hämta SHL-tabellen")?;
     // Standings-sidan innehåller även hemma, borta och senaste matcher.
     // Den första kompletta rankingen är totalställningen för grundserien.
-    let standings: Vec<Record> = standings
-        .into_iter()
-        .filter(|row| row.0.len() >= 8 && row.0[0].parse::<usize>().is_ok())
-        .take(SHL_TEAM_COUNT)
-        .collect();
+    let standings = normalize_standings(standings);
     let team_names: Vec<String> = standings
         .iter()
         .filter_map(|row| row.0.get(1).cloned())
@@ -236,10 +232,56 @@ fn fetch_all_players(url: &str, standings_teams: &[String]) -> Result<Vec<Record
                 row[5].clone(),
                 row[6].clone(),
                 row[7].clone(),
+                row.get(11).cloned().unwrap_or_default(),
             ]));
         }
     }
     Ok(players)
+}
+
+fn normalize_standings(rows: Vec<Record>) -> Vec<Record> {
+    rows.into_iter()
+        .filter(|row| {
+            row.0
+                .first()
+                .is_some_and(|rank| rank.parse::<usize>().is_ok())
+        })
+        .take(SHL_TEAM_COUNT)
+        .map(|row| {
+            let c = &row.0;
+            let (goals_for, goals_against, goal_diff, points) = if c.len() >= 9 {
+                let (for_goals, against_and_diff) = c[6].split_once(':').unwrap_or((&c[6], ""));
+                let against = against_and_diff.split_whitespace().next().unwrap_or("—");
+                (
+                    for_goals.trim().to_owned(),
+                    against.to_owned(),
+                    c[7].clone(),
+                    c[8].clone(),
+                )
+            } else if c.len() >= 8 {
+                ("—".to_owned(), "—".to_owned(), c[6].clone(), c[7].clone())
+            } else {
+                (
+                    "—".to_owned(),
+                    "—".to_owned(),
+                    "—".to_owned(),
+                    "—".to_owned(),
+                )
+            };
+            Record(vec![
+                c[0].clone(),
+                c[1].clone(),
+                c[2].clone(),
+                c[3].clone(),
+                c[4].clone(),
+                c[5].clone(),
+                goals_for,
+                goals_against,
+                goal_diff,
+                points,
+            ])
+        })
+        .collect()
 }
 
 fn is_date(value: &str) -> bool {
@@ -318,12 +360,14 @@ struct App {
     data: Data,
     tab: usize,
     selected: usize,
-    sort: Option<(usize, bool)>,
+    sort: Option<(usize, bool, bool)>,
+    search_query: String,
+    searching: bool,
     status: String,
 }
 
 fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> Result<()> {
-    let mut app = App { data, tab: 0, selected: 0, sort: None, status: "↑/↓ navigera  •  Tab byt flik  •  g mål  •  a assist  •  p poäng  •  r uppdatera  •  q avsluta".into() };
+    let mut app = App { data, tab: 0, selected: 0, sort: None, search_query: String::new(), searching: false, status: "↑/↓ navigera  •  g/a/p/x sortera  •  G/A/P/X per lag  •  / sök  •  r uppdatera  •  q avsluta".into() };
     loop {
         terminal.draw(|frame| {
             let area = frame.area();
@@ -366,17 +410,40 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                 .block(Block::default().borders(Borders::BOTTOM)),
                 chunks[0],
             );
+            let filtered_players: Vec<Record> = app
+                .data
+                .players
+                .iter()
+                .filter(|player| {
+                    player.0.get(1).is_some_and(|name| {
+                        name.to_lowercase()
+                            .contains(&app.search_query.to_lowercase())
+                    })
+                })
+                .cloned()
+                .collect();
             let (headers, records): (Vec<&str>, &Vec<Record>) = match app.tab {
                 0 => (
                     vec!["Datum", "Match", "Resultat", "Perioder / arena"],
                     &app.data.games,
                 ),
                 1 => (
-                    vec!["#", "Spelare", "Lag", "GP", "G", "A", "P"],
-                    &app.data.players,
+                    vec!["#", "Spelare", "Lag", "GP", "G", "A", "P", "+/-"],
+                    &filtered_players,
                 ),
                 _ => (
-                    vec!["#", "Lag", "SP", "V", "O", "F", "+/-", "P"],
+                    vec![
+                        "#",
+                        "Lag",
+                        "SP",
+                        "V",
+                        "O",
+                        "F",
+                        "Gjorda",
+                        "Insläppta",
+                        "Målskillnad",
+                        "P",
+                    ],
                     &app.data.standings,
                 ),
             };
@@ -395,6 +462,7 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                     Constraint::Length(5),
                     Constraint::Length(5),
                     Constraint::Length(5),
+                    Constraint::Length(5),
                 ],
                 _ => vec![
                     Constraint::Length(5),
@@ -403,30 +471,60 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                     Constraint::Length(5),
                     Constraint::Length(5),
                     Constraint::Length(5),
-                    Constraint::Length(7),
+                    Constraint::Length(8),
+                    Constraint::Length(11),
+                    Constraint::Length(11),
                     Constraint::Length(5),
                 ],
             };
-            let rows = records
-                .iter()
-                .map(|r| Row::new(r.0.iter().cloned().map(Cell::from).collect::<Vec<_>>()));
+            let rows = records.iter().map(|r| {
+                let cells =
+                    r.0.iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            let cell = Cell::from(value.clone());
+                            if app.tab == 1 && app.sort.is_some_and(|(col, _, _)| col == index) {
+                                cell.style(Style::default().add_modifier(Modifier::BOLD))
+                            } else {
+                                cell
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                Row::new(cells)
+            });
             let player_title = format!(
-                " SPELARE ({}) · g mål · a assist · p poäng (sortera) ",
-                app.data.players.len()
+                " SPELARE ({}) · g/a/p/x globalt · G/A/P/X lagvis ",
+                filtered_players.len()
             );
             let title = match app.tab {
                 0 => " MATCHER · två senaste och två kommande omgångar ",
                 1 => player_title.as_str(),
                 _ => " SHL-TABELL · grundserien ",
             };
+            let header = Row::new(
+                headers
+                    .iter()
+                    .enumerate()
+                    .map(|(index, label)| {
+                        let cell = Cell::from(*label);
+                        if app.tab == 1 && app.sort.is_some_and(|(col, _, _)| col == index) {
+                            cell.style(
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        } else {
+                            cell.style(
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            );
             let table = Table::new(rows, widths)
-                .header(
-                    Row::new(headers).style(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                )
+                .header(header)
                 .block(Block::default().title(title).borders(Borders::ALL))
                 .row_highlight_style(
                     Style::default()
@@ -438,8 +536,16 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                 state.select(Some(app.selected.min(records.len() - 1)));
             }
             frame.render_stateful_widget(table, chunks[1], &mut state);
+            let footer = if app.searching {
+                format!(
+                    "Sök spelare: {}▏  Enter: klart  Esc: rensa/avbryt",
+                    app.search_query
+                )
+            } else {
+                app.status.clone()
+            };
             frame.render_widget(
-                Paragraph::new(app.status.clone()).style(Style::default().fg(Color::Gray)),
+                Paragraph::new(footer).style(Style::default().fg(Color::Gray)),
                 chunks[2],
             );
         })?;
@@ -448,8 +554,37 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                if app.searching {
+                    match key.code {
+                        KeyCode::Esc => {
+                            app.search_query.clear();
+                            app.searching = false;
+                            app.selected = 0;
+                            app.status = "Sökningen rensad.".into();
+                        }
+                        KeyCode::Enter => {
+                            app.searching = false;
+                            app.selected = 0;
+                        }
+                        KeyCode::Backspace => {
+                            app.search_query.pop();
+                            app.selected = 0;
+                        }
+                        KeyCode::Char(c) => {
+                            app.search_query.push(c);
+                            app.selected = 0;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('/') if app.tab == 1 => {
+                        app.searching = true;
+                        app.search_query.clear();
+                        app.selected = 0;
+                    }
                     KeyCode::Tab | KeyCode::Right => {
                         app.tab = (app.tab + 1) % 3;
                         app.selected = 0;
@@ -478,16 +613,32 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                         }
                         Err(error) => app.status = format!("Uppdatering misslyckades: {error:#}"),
                     },
-                    KeyCode::Char('g') | KeyCode::Char('a') | KeyCode::Char('p')
+                    KeyCode::Char('g')
+                    | KeyCode::Char('a')
+                    | KeyCode::Char('p')
+                    | KeyCode::Char('x')
+                    | KeyCode::Char('G')
+                    | KeyCode::Char('A')
+                    | KeyCode::Char('P')
+                    | KeyCode::Char('X')
                         if app.tab == 1 =>
                     {
-                        let col = match key.code {
-                            KeyCode::Char('g') => 4,
-                            KeyCode::Char('a') => 5,
-                            _ => 6,
+                        let (col, by_team) = match key.code {
+                            KeyCode::Char('g') => (4, false),
+                            KeyCode::Char('a') => (5, false),
+                            KeyCode::Char('p') => (6, false),
+                            KeyCode::Char('x') => (7, false),
+                            KeyCode::Char('G') => (4, true),
+                            KeyCode::Char('A') => (5, true),
+                            KeyCode::Char('P') => (6, true),
+                            _ => (7, true),
                         };
                         let descending = match app.sort {
-                            Some((old_col, desc)) if old_col == col => !desc,
+                            Some((old_col, desc, old_team))
+                                if old_col == col && old_team == by_team =>
+                            {
+                                !desc
+                            }
                             _ => true,
                         };
                         app.data.players.sort_by(|a, b| {
@@ -499,22 +650,29 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
                                 b.0.get(col)
                                     .and_then(|v| v.parse::<i32>().ok())
                                     .unwrap_or_default();
-                            if descending { bv.cmp(&av) } else { av.cmp(&bv) }
+                            let metric = if descending { bv.cmp(&av) } else { av.cmp(&bv) };
+                            if by_team {
+                                a.0.get(2).cmp(&b.0.get(2)).then(metric)
+                            } else {
+                                metric
+                            }
                         });
                         for (rank, row) in app.data.players.iter_mut().enumerate() {
                             if !row.0.is_empty() {
                                 row.0[0] = (rank + 1).to_string();
                             }
                         }
-                        app.sort = Some((col, descending));
+                        app.sort = Some((col, descending, by_team));
                         app.selected = 0;
                         let category = match col {
-                            4 => "på mål",
-                            5 => "på assist",
-                            _ => "på poäng",
+                            4 => "mål",
+                            5 => "assist",
+                            6 => "poäng",
+                            _ => "+/-",
                         };
                         app.status = format!(
-                            "Sorterat {category} {}. Tryck samma tangent igen för motsatt ordning.",
+                            "Sorterat {} {category} {}. Tryck samma tangent igen för motsatt ordning.",
+                            if by_team { "lagvis på" } else { "globalt på" },
                             if descending { "fallande" } else { "stigande" }
                         );
                     }
