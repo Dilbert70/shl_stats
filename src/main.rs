@@ -82,9 +82,12 @@ fn fetch_data() -> Result<Data> {
     let (_, all_games) = fetch_table(&games_url, &["date", "game", "result"])
         .context("Kunde inte hämta matchinformation")?;
     let games = latest_and_upcoming_rounds(all_games);
-    let (_, raw_players) = fetch_table(&players_url, &["name", "team", "gp", "tp"])
-        .context("Kunde inte hämta spelarstatistik")?;
-    let players = normalize_players(raw_players);
+    let mut players = fetch_players(&players_url).context("Kunde inte hämta spelarstatistik")?;
+    if players.is_empty() {
+        let (_, raw_players) = fetch_table(&players_url, &["name", "team", "gp", "tp"])
+            .context("Kunde inte hämta spelarstatistik")?;
+        players = normalize_players(raw_players);
+    }
     let (_, standings) = fetch_table(&standings_url, &["rk", "team", "gp", "gd", "tp"])
         .context("Kunde inte hämta SHL-tabellen")?;
     // Standings-sidan innehåller även hemma, borta och senaste matcher.
@@ -96,19 +99,57 @@ fn fetch_data() -> Result<Data> {
     Ok(Data { games, players, standings, season: "SHL • aktuell säsong".into() })
 }
 
-fn normalize_players(rows: Vec<Record>) -> Vec<Record> {
-    rows.into_iter().filter_map(|row| {
-        if row.0.len() < 8 || row.0[0].parse::<usize>().is_err() { return None; }
-        let team = match row.0[2].as_str() {
+fn full_team_name(code: &str) -> &str {
+    match code {
             "BIF" => "Brynäs IF", "DIF" => "Djurgårdens IF", "FRÖ" => "Frölunda HC",
             "FBK" => "Färjestad BK", "HV71" => "HV 71", "IFB" => "IF Björklöven",
             "MIF" => "IF Malmö Redhawks", "LHC" => "Linköping HC", "LHF" => "Luleå HF",
             "RBK" => "Rögle BK", "SKE" => "Skellefteå AIK", "TIK" => "Timrå IK",
             "VÄX" => "Växjö Lakers HC", "ÖHK" => "Örebro HK", code => code,
-        };
-        Some(Record(vec![row.0[0].clone(), row.0[1].clone(), team.to_owned(),
+    }
+}
+
+fn normalize_players(rows: Vec<Record>) -> Vec<Record> {
+    rows.into_iter().filter_map(|row| {
+        if row.0.len() < 8 || row.0[0].parse::<usize>().is_err() { return None; }
+        let team = full_team_name(&row.0[2]).to_owned();
+        Some(Record(vec![row.0[0].clone(), row.0[1].clone(), team,
             row.0[4].clone(), row.0[5].clone(), row.0[6].clone(), row.0[7].clone()]))
     }).collect()
+}
+
+fn fetch_players(url: &str) -> Result<Vec<Record>> {
+    let body = http_client()?.get(url).send()?.error_for_status()?.text()?;
+    let document = Html::parse_document(&body);
+    let table_sel = Selector::parse("table").unwrap();
+    let row_sel = Selector::parse("tr").unwrap();
+    let cell_sel = Selector::parse("th, td").unwrap();
+    let mut best: Option<(usize, Vec<Vec<String>>, [usize; 7])> = None;
+    for table in document.select(&table_sel) {
+        let rows: Vec<Vec<String>> = table.select(&row_sel).map(|row| row.select(&cell_sel)
+            .map(|cell| cell.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<String>>()).filter(|row| !row.is_empty()).collect();
+        let Some(header) = rows.first() else { continue; };
+        let lower: Vec<String> = header.iter().map(|v| v.to_ascii_lowercase()).collect();
+        let find = |names: &[&str]| lower.iter().position(|v| names.contains(&v.as_str()));
+        let Some(indices) = (|| Some([
+            find(&["rk", "rank"] )?, find(&["name"] )?, find(&["team"] )?,
+            find(&["gp"] )?, find(&["g"] )?, find(&["a"] )?, find(&["tp", "pts", "points"] )?,
+        ]))() else { continue; };
+        let score = ["rk", "name", "team", "gp", "g", "a", "tp"].iter()
+            .filter(|wanted| lower.iter().any(|item| item == **wanted)).count();
+        if best.as_ref().is_none_or(|(old, _, _)| score > *old) { best = Some((score, rows, indices)); }
+    }
+    let (_, rows, indices) = best.context("Hittade ingen spelarstatistiktabell med kolumner för lag och poäng")?;
+    Ok(rows.into_iter().skip(1).filter_map(|row| {
+        let value = |i: usize| row.get(i).cloned();
+        let rank = value(indices[0])?;
+        if rank.parse::<usize>().is_err() { return None; }
+        let team_code = value(indices[2])?;
+        let team = full_team_name(&team_code).to_owned();
+        Some(Record(vec![rank, value(indices[1])?, team, value(indices[3])?,
+            value(indices[4])?, value(indices[5])?, value(indices[6])?]))
+    }).collect())
 }
 
 fn is_date(value: &str) -> bool {
@@ -181,7 +222,8 @@ fn run_ui(mut terminal: Terminal<CrosstermBackend<io::Stdout>>, data: Data) -> R
             let rows = records.iter().map(|r| {
                 Row::new(r.0.iter().cloned().map(Cell::from).collect::<Vec<_>>())
             });
-            let title = match app.tab { 0 => " MATCHER · två senaste och två kommande omgångar ", 1 => " SPELARE · g mål · p poäng (sortera) ", _ => " SHL-TABELL · grundserien " };
+            let player_title = format!(" SPELARE ({}) · g mål · p poäng (sortera) ", app.data.players.len());
+            let title = match app.tab { 0 => " MATCHER · två senaste och två kommande omgångar ", 1 => player_title.as_str(), _ => " SHL-TABELL · grundserien " };
             let table = Table::new(rows, widths).header(Row::new(headers).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)))
                 .block(Block::default().title(title).borders(Borders::ALL))
                 .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
