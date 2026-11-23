@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, io, time::Duration};
+use std::{io, time::Duration};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -24,6 +24,7 @@ struct Record(Vec<String>);
 
 struct Data {
     games: Vec<Record>,
+    games_boundary: usize,
     players: Vec<Record>,
     goalies: Vec<Record>,
     standings: Vec<Record>,
@@ -190,12 +191,12 @@ fn available_shl_seasons(current_id: &str) -> Result<Vec<Season>> {
 
 fn fetch_data(season: &Season) -> Result<Data> {
     let season_id = &season.id;
-    let games_url = format!("{BASE_URL}/ScheduleAndResults/Overview/{season_id}");
+    let games_url = format!("{BASE_URL}/ScheduleAndResults/Schedule/{season_id}");
     let players_url = format!("{BASE_URL}/Teams/Info/PlayersByTeam/{season_id}");
     let standings_url = format!("{BASE_URL}/ScheduleAndResults/Standings/{season_id}");
     let (_, all_games) = fetch_table(&games_url, &["date", "game", "result"])
         .context("Kunde inte hämta matchinformation")?;
-    let games = latest_and_upcoming_rounds(all_games);
+    let (games, games_boundary) = all_season_games(all_games);
     let (_, standings) = fetch_table(&standings_url, &["rk", "team", "gp", "gd", "tp"])
         .context("Kunde inte hämta SHL-tabellen")?;
     // Standings-sidan innehåller även hemma, borta och senaste matcher.
@@ -211,6 +212,7 @@ fn fetch_data(season: &Season) -> Result<Data> {
         fetch_goalies(&players_url, &team_names).context("Kunde inte hämta målvaktsstatistik")?;
     Ok(Data {
         games,
+        games_boundary,
         players,
         goalies,
         standings,
@@ -522,6 +524,16 @@ fn is_date(value: &str) -> bool {
             .all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit())
 }
 
+fn is_time(value: &str) -> bool {
+    let Some((hours, minutes)) = value.split_once(':') else {
+        return false;
+    };
+    hours.len() == 2
+        && minutes.len() == 2
+        && hours.chars().all(|ch| ch.is_ascii_digit())
+        && minutes.chars().all(|ch| ch.is_ascii_digit())
+}
+
 fn is_score(value: &str) -> bool {
     let Some((home, away)) = value.split_once('-') else {
         return false;
@@ -529,58 +541,114 @@ fn is_score(value: &str) -> bool {
     home.trim().parse::<u16>().is_ok() && away.trim().parse::<u16>().is_ok()
 }
 
-fn latest_and_upcoming_rounds(rows: Vec<Record>) -> Vec<Record> {
+fn all_season_games(rows: Vec<Record>) -> (Vec<Record>, usize) {
     let mut matches = Vec::new();
-    let mut played_dates = BTreeSet::new();
-    let mut future_dates = BTreeSet::new();
+    let mut first_upcoming = None;
+    let mut current_date = String::new();
 
     for row in rows {
-        if row.0.len() < 3 || !is_date(&row.0[0]) {
+        if row.0.is_empty() {
             continue;
         }
-        let date = row.0[0].chars().take(10).collect::<String>();
+        let offset = if is_date(&row.0[0]) {
+            current_date = row.0[0].chars().take(10).collect();
+            1
+        } else {
+            0
+        };
+        if current_date.is_empty() || row.0.len() <= offset + 1 {
+            continue;
+        }
+        // Schedule pages group games underneath a date row. Some seasons instead
+        // repeat the date on every game row, which the offset handles as well.
+        let date = current_date.clone();
+        let has_time = row
+            .0
+            .get(offset)
+            .is_some_and(|value| value.contains(':') && value.len() <= 5);
+        let game_index = offset + usize::from(has_time);
         let score_index = row
             .0
             .iter()
             .enumerate()
-            .skip(2)
+            .skip(game_index + 1)
             .find(|(_, value)| is_score(value))
             .map(|(i, _)| i);
+        let game_end = score_index.unwrap_or_else(|| row.0.len().saturating_sub(1));
+        let team_names = row
+            .0
+            .iter()
+            .take(game_end)
+            .skip(game_index)
+            .filter_map(|value| {
+                let value = value.trim();
+                let value = if let (Some(date), Some(rest)) = (value.get(..10), value.get(10..)) {
+                    if is_date(date) { rest } else { value }
+                } else {
+                    value
+                };
+                let cleaned = value
+                    .split_whitespace()
+                    .filter(|part| !is_date(part) && !is_time(part))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if cleaned.is_empty() || matches!(cleaned.as_str(), "-" | "–" | "—") {
+                    None
+                } else {
+                    Some(cleaned)
+                }
+            })
+            .collect::<Vec<_>>();
+        let game = if team_names.len() == 1 {
+            if let Some((home, away)) = team_names[0].split_once(" - ") {
+                format!("{home} - {away}")
+            } else {
+                team_names[0].clone()
+            }
+        } else if team_names.len() >= 2 {
+            format!("{} - {}", team_names[0], team_names[1])
+        } else {
+            String::new()
+        };
         let (score, details, played) = if let Some(index) = score_index {
-            played_dates.insert(date.clone());
             (
                 row.0[index].clone(),
                 row.0.get(index + 1).cloned().unwrap_or_default(),
                 true,
             )
         } else {
-            future_dates.insert(date.clone());
+            first_upcoming.get_or_insert(matches.len());
             (
                 "—".to_owned(),
                 row.0.last().cloned().unwrap_or_default(),
                 false,
             )
         };
+        let attendance = if played {
+            // Schedule rows may include attendance as a numeric field after venue.
+            row.0
+                .iter()
+                .skip(3)
+                .find(|value| {
+                    let digits = value.replace([',', '.', ' '], "");
+                    digits.len() >= 3 && digits.chars().all(|ch| ch.is_ascii_digit())
+                })
+                .cloned()
+                .unwrap_or_else(|| "—".to_owned())
+        } else {
+            "—".to_owned()
+        };
+        if game.chars().all(|ch| ch.is_ascii_digit() || ch == ':') {
+            continue;
+        }
         matches.push((
             date,
-            played,
-            Record(vec![row.0[0].clone(), row.0[1].clone(), score, details]),
+            Record(vec![current_date.clone(), game, score, details, attendance]),
         ));
     }
-
-    let recent: BTreeSet<String> = played_dates.iter().rev().take(2).cloned().collect();
-    let upcoming: BTreeSet<String> = future_dates.iter().take(2).cloned().collect();
-    matches
-        .into_iter()
-        .filter(|(date, played, _)| {
-            if *played {
-                recent.contains(date)
-            } else {
-                upcoming.contains(date)
-            }
-        })
-        .map(|(_, _, row)| row)
-        .collect()
+    let games = matches.into_iter().map(|(_, row)| row).collect::<Vec<_>>();
+    let boundary = first_upcoming.unwrap_or(games.len());
+    (games, boundary)
 }
 
 struct App {
@@ -604,12 +672,13 @@ fn run_ui(
     seasons: Vec<Season>,
     season_index: usize,
 ) -> Result<()> {
+    let initial_game = data.games_boundary;
     let mut app = App {
         data,
         seasons,
         season_index,
         tab: 0,
-        selected: 0,
+        selected: initial_game,
         sort: None,
         search_query: String::new(),
         searching: false,
@@ -677,10 +746,21 @@ fn run_ui(
                 })
                 .cloned()
                 .collect();
+            let filtered_games: Vec<Record> = app
+                .data
+                .games
+                .iter()
+                .filter(|game| {
+                    game.0.get(1).is_some_and(|teams| {
+                        teams.to_lowercase().contains(&app.team_filter.to_lowercase())
+                    })
+                })
+                .cloned()
+                .collect();
             let (headers, records): (Vec<&str>, &Vec<Record>) = match app.tab {
                 0 => (
-                    vec!["Datum", "Match", "Resultat", "Perioder / arena"],
-                    &app.data.games,
+                    vec!["Datum", "Match", "Resultat", "Arena / perioder", "Publik"],
+                    &filtered_games,
                 ),
                 1 => (
                     vec![
@@ -721,9 +801,10 @@ fn run_ui(
             let widths = match app.tab {
                 0 => vec![
                     Constraint::Length(18),
-                    Constraint::Min(35),
+                    Constraint::Min(28),
                     Constraint::Length(12),
                     Constraint::Min(20),
+                    Constraint::Length(9),
                 ],
                 1 => vec![
                     Constraint::Length(5),
@@ -797,7 +878,7 @@ fn run_ui(
                 }
             );
             let title = match app.tab {
-                0 => " MATCHER · två senaste och två kommande omgångar ",
+                0 => " MATCHER · hela säsongen · start vid senaste/kommande ",
                 1 => player_title.as_str(),
                 2 => " SHL-TABELL · grundserien ",
                 _ => " MÅLVAKTER · SHL ",
@@ -857,7 +938,7 @@ fn run_ui(
                 app.status.clone()
             };
             let help = format!(
-                "{footer}\nTab flikar | ↑↓ navigera | PgUp äldre / PgDn nyare säsong | / namn | l lag | r uppdatera | q avsluta\nSpelare: g/a/p/x stats, i PIM, m/b/e snitt; versaler = lagvis | SHL: p poäng, s snitt\nMålvakt: g GP, s skott emot, v räddnings%, w vinster, c räddade; versaler = lagvis"
+                "{footer}\nTab flikar | ↑↓ navigera | PgUp äldre / PgDn nyare säsong | / namn | f matchfilter | l spelarfilter | r uppdatera | q avsluta\nSpelare: g/a/p/x stats, i PIM, m/b/e snitt; versaler = lagvis | SHL: p poäng, s snitt\nMålvakt: g GP, s skott emot, v räddnings%, w vinster, c räddade; versaler = lagvis"
             );
             frame.render_widget(
                 Paragraph::new(help).style(Style::default().fg(Color::Gray)),
@@ -933,6 +1014,10 @@ fn run_ui(
                         app.searching_team = true;
                         app.team_query = app.team_filter.clone();
                     }
+                    KeyCode::Char('f') if app.tab == 0 => {
+                        app.searching_team = true;
+                        app.team_query = app.team_filter.clone();
+                    }
                     KeyCode::Tab | KeyCode::Right => {
                         app.tab = (app.tab + 1) % 4;
                         app.selected = 0;
@@ -943,7 +1028,18 @@ fn run_ui(
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         let len = match app.tab {
-                            0 => app.data.games.len(),
+                            0 => app
+                                .data
+                                .games
+                                .iter()
+                                .filter(|game| {
+                                    game.0.get(1).is_some_and(|teams| {
+                                        teams
+                                            .to_lowercase()
+                                            .contains(&app.team_filter.to_lowercase())
+                                    })
+                                })
+                                .count(),
                             1 => app.data.players.len(),
                             2 => app.data.standings.len(),
                             _ => app.data.goalies.len(),
@@ -967,7 +1063,7 @@ fn run_ui(
                                 Ok(data) => {
                                     app.data = data;
                                     app.season_index = next;
-                                    app.selected = 0;
+                                    app.selected = app.data.games_boundary;
                                     app.sort = None;
                                     app.status = format!("Visar {}.", app.data.season);
                                 }
@@ -987,7 +1083,7 @@ fn run_ui(
                     KeyCode::Char('r') => match fetch_data(&app.seasons[app.season_index]) {
                         Ok(data) => {
                             app.data = data;
-                            app.selected = 0;
+                            app.selected = app.data.games_boundary;
                             app.sort = None;
                             app.status = "Data uppdaterad.".into();
                         }
