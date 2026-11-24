@@ -1,4 +1,7 @@
-use std::{io, time::Duration};
+use std::{
+    io,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -110,7 +113,9 @@ fn current_shl_id() -> Result<String> {
         .error_for_status()?
         .text()?;
     let document = Html::parse_document(&body);
-    let links = Selector::parse("a[href*='/ScheduleAndResults/Overview/']").unwrap();
+    // The league link on the start page points to the live view now; older
+    // versions pointed to Overview. Both routes carry the season ID.
+    let links = Selector::parse("a[href*='/ScheduleAndResults/']").unwrap();
     document
         .select(&links)
         .find_map(|link| {
@@ -120,8 +125,10 @@ fn current_shl_id() -> Result<String> {
             }
             link.value()
                 .attr("href")?
+                .trim_end_matches('/')
                 .rsplit('/')
                 .next()
+                .filter(|id| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()))
                 .map(str::to_owned)
         })
         .context("Kunde inte hitta aktuell SHL-säsong på stats.swehockey.se")
@@ -218,6 +225,85 @@ fn fetch_data(season: &Season) -> Result<Data> {
         standings,
         season: season.label.clone(),
     })
+}
+
+fn fetch_live_games(season_id: &str, teams: &[String]) -> Result<Vec<Record>> {
+    let url = format!("{BASE_URL}/ScheduleAndResults/Live/{season_id}");
+    let body = http_client()?
+        .get(&url)
+        .send()?
+        .error_for_status()?
+        .text()?;
+    let document = Html::parse_document(&body);
+    let selector = Selector::parse("div, li, tr, article, section").unwrap();
+    let mut games = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for element in document.select(&selector) {
+        let text = element.text().collect::<Vec<_>>().join(" ");
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.len() > 500 {
+            continue;
+        }
+        let participating: Vec<&String> = teams
+            .iter()
+            .filter(|team| text.contains(team.as_str()))
+            .collect();
+        if participating.len() != 2 {
+            continue;
+        }
+        let lower = text.to_lowercase();
+        let active = [
+            "period",
+            "intermission",
+            "overtime",
+            "shootout",
+            "pågår",
+            "paus",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+        if !active {
+            continue;
+        }
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let mut score = None;
+        for (index, word) in words.iter().enumerate() {
+            let candidate = word.trim_matches(|ch: char| matches!(ch, '(' | ')' | '[' | ']'));
+            if is_score(candidate) {
+                score = Some(candidate.to_owned());
+                break;
+            }
+            if index + 2 < words.len()
+                && words[index].parse::<u16>().is_ok()
+                && words[index + 1] == "-"
+                && words[index + 2].parse::<u16>().is_ok()
+            {
+                score = Some(format!("{}-{}", words[index], words[index + 2]));
+                break;
+            }
+        }
+        let Some(score) = score else { continue };
+        let home = participating[0].as_str();
+        let away = participating[1].as_str();
+        if !seen.insert((home.to_owned(), away.to_owned(), score.clone())) {
+            continue;
+        }
+        let status = words
+            .iter()
+            .position(|word| {
+                let word = word.to_lowercase();
+                word.contains("period")
+                    || word.contains("intermission")
+                    || word.contains("overtime")
+                    || word.contains("shootout")
+                    || word.contains("paus")
+            })
+            .map(|index| words[index..].join(" "))
+            .unwrap_or_else(|| "Pågår".to_owned());
+        games.push(Record(vec![format!("{home} - {away}"), score, status]));
+    }
+    Ok(games)
 }
 
 fn fetch_all_players(url: &str, standings_teams: &[String]) -> Result<Vec<Record>> {
@@ -664,6 +750,8 @@ struct App {
     team_filter: String,
     team_query: String,
     status: String,
+    live_games: Vec<Record>,
+    last_live_refresh: Instant,
 }
 
 fn run_ui(
@@ -686,8 +774,29 @@ fn run_ui(
         team_filter: String::new(),
         team_query: String::new(),
         status: "Redo.".into(),
+        live_games: Vec::new(),
+        last_live_refresh: Instant::now(),
     };
     loop {
+        if app.tab == 4 && app.last_live_refresh.elapsed() >= Duration::from_secs(30) {
+            let teams: Vec<String> = app
+                .data
+                .standings
+                .iter()
+                .filter_map(|row| row.0.get(1).cloned())
+                .collect();
+            match fetch_live_games(&app.seasons[app.season_index].id, &teams) {
+                Ok(games) => {
+                    app.live_games = games;
+                    app.status = format!(
+                        "Live uppdaterad · {} pågående matcher",
+                        app.live_games.len()
+                    );
+                }
+                Err(error) => app.status = format!("Liveuppdatering misslyckades: {error:#}"),
+            }
+            app.last_live_refresh = Instant::now();
+        }
         terminal.draw(|frame| {
             let area = frame.area();
             let chunks = Layout::default()
@@ -698,7 +807,7 @@ fn run_ui(
                     Constraint::Length(4),
                 ])
                 .split(area);
-            let tabs = ["MATCHER", "SPELARE", "SHL-TABELL", "MÅLVAKTER"]
+            let tabs = ["MATCHER", "SPELARE", "SHL-TABELL", "MÅLVAKTER", "LIVE"]
                 .iter()
                 .enumerate()
                 .map(|(i, label)| {
@@ -784,7 +893,7 @@ fn run_ui(
                     ],
                     &app.data.standings,
                 ),
-                _ => (
+                3 => (
                     vec![
                         "#",
                         "Målvakt",
@@ -796,6 +905,10 @@ fn run_ui(
                         "Räddade skott",
                     ],
                     &app.data.goalies,
+                ),
+                _ => (
+                    vec!["Match", "Ställning", "Period / tid"],
+                    &app.live_games,
                 ),
             };
             let widths = match app.tab {
@@ -833,7 +946,7 @@ fn run_ui(
                     Constraint::Length(5),
                     Constraint::Length(7),
                 ],
-                _ => vec![
+                3 => vec![
                     Constraint::Length(5),
                     Constraint::Fill(1),
                     Constraint::Length(22),
@@ -843,6 +956,7 @@ fn run_ui(
                     Constraint::Length(8),
                     Constraint::Length(13),
                 ],
+                _ => vec![Constraint::Min(35), Constraint::Length(12), Constraint::Min(24)],
             };
             let mut rows = Vec::with_capacity(records.len() + 3);
             for (record_index, r) in records.iter().enumerate() {
@@ -881,7 +995,8 @@ fn run_ui(
                 0 => " MATCHER · hela säsongen · start vid senaste/kommande ",
                 1 => player_title.as_str(),
                 2 => " SHL-TABELL · grundserien ",
-                _ => " MÅLVAKTER · SHL ",
+                3 => " MÅLVAKTER · SHL ",
+                _ => " LIVE · pågående matcher · uppdateras var 30:e sekund ",
             };
             let header = Row::new(
                 headers
@@ -1019,12 +1134,18 @@ fn run_ui(
                         app.team_query = app.team_filter.clone();
                     }
                     KeyCode::Tab | KeyCode::Right => {
-                        app.tab = (app.tab + 1) % 4;
+                        app.tab = (app.tab + 1) % 5;
                         app.selected = 0;
+                        if app.tab == 4 {
+                            app.last_live_refresh = Instant::now() - Duration::from_secs(30);
+                        }
                     }
                     KeyCode::Left => {
-                        app.tab = (app.tab + 3) % 4;
+                        app.tab = (app.tab + 4) % 5;
                         app.selected = 0;
+                        if app.tab == 4 {
+                            app.last_live_refresh = Instant::now() - Duration::from_secs(30);
+                        }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         let len = match app.tab {
@@ -1042,7 +1163,8 @@ fn run_ui(
                                 .count(),
                             1 => app.data.players.len(),
                             2 => app.data.standings.len(),
-                            _ => app.data.goalies.len(),
+                            3 => app.data.goalies.len(),
+                            _ => app.live_games.len(),
                         };
                         app.selected = app.selected.saturating_add(1).min(len.saturating_sub(1));
                     }
@@ -1079,6 +1201,27 @@ fn run_ui(
                                 "Redan på den nyaste säsongen.".into()
                             };
                         }
+                    }
+                    KeyCode::Char('r') if app.tab == 4 => {
+                        let teams: Vec<String> = app
+                            .data
+                            .standings
+                            .iter()
+                            .filter_map(|row| row.0.get(1).cloned())
+                            .collect();
+                        match fetch_live_games(&app.seasons[app.season_index].id, &teams) {
+                            Ok(games) => {
+                                app.live_games = games;
+                                app.status = format!(
+                                    "Live uppdaterad · {} pågående matcher",
+                                    app.live_games.len()
+                                );
+                            }
+                            Err(error) => {
+                                app.status = format!("Liveuppdatering misslyckades: {error:#}")
+                            }
+                        }
+                        app.last_live_refresh = Instant::now();
                     }
                     KeyCode::Char('r') => match fetch_data(&app.seasons[app.season_index]) {
                         Ok(data) => {

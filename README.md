@@ -42,7 +42,7 @@ Du kan också starta direkt från projektmappen med `cargo run`. Då bygger Carg
 
 ## Flikar och navigering
 
-Tryck `Tab` eller `→` för nästa flik och `←` för föregående. Flikarna är Matcher, Spelare, SHL-tabell och Målvakter. Använd `↑`/`↓` eller `k`/`j` för att flytta markeringen i listan.
+Tryck `Tab` eller `→` för nästa flik och `←` för föregående. Flikarna är Matcher, Spelare, SHL-tabell, Målvakter och Live. Använd `↑`/`↓` eller `k`/`j` för att flytta markeringen i listan.
 
 Tryck `PageUp` för en äldre säsong och `PageDown` för en nyare. `[` och `]` fungerar också som alternativ. Tryck `r` för att hämta om statistiken för vald säsong. Tryck `q` eller `Esc` för att avsluta när du inte skriver i ett sökfält.
 
@@ -79,6 +79,10 @@ Tryck samma tangent igen för att vända sorteringsordningen.
 ## Målvakter
 
 Visar spelade matcher (GP), skott emot, räddningsprocent, vinster och räddade skott.
+
+## Live
+
+Visar ställning och period/tid för SHL-matcher som spelas just nu. Vyn uppdateras automatiskt var 30:e sekund när Live-fliken är öppen. Tryck `r` för att hämta senaste läget direkt.
 
 | Tangent | Funktion |
 | --- | --- |
